@@ -155,7 +155,7 @@ Optional (for examples and plotting): `matplotlib`, `pandas`, `jupyter`
 If you use this package, please cite:
 
 ```
-Pe, Z. (2025). STWM: Dynamic Spatial-Temporal Weight Matrices (Python package).
+TBD. STWM: Dynamic Spatial-Temporal Weight Matrices (Python package).
 GitHub: https://github.com/ZiningPe/STWM
 ```
 
