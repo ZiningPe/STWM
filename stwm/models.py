@@ -57,6 +57,7 @@ Halleck Vega, S., & Elhorst, J. P. (2015). Journal of Regional Science, 55(3), 3
 import numpy as np
 from scipy import stats, optimize
 from typing import Tuple
+import warnings
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,57 @@ def _ols_fit(Y: np.ndarray, X: np.ndarray) -> dict:
                 residuals=resid, sigma2=sigma2, cov=cov, R2=R2)
 
 
+def _numerical_hessian_scalar(func, x0: float, eps: float = 1e-4) -> float:
+    """
+    Compute the second derivative (Hessian) of a scalar function at x0.
+
+    Uses the central difference formula:
+        f''(x) ≈ [f(x+h) - 2f(x) + f(x-h)] / h²
+
+    This is critical for computing SE(ρ) or SE(λ) from the concentrated
+    log-likelihood. The first derivative (gradient) is ≈ 0 at the optimum,
+    so using approx_fprime (first derivative) would give SE → ∞.
+
+    Reference: Elhorst (2014), the information matrix requires ∂²(-lnL)/∂ρ².
+    """
+    f_plus  = func(x0 + eps)
+    f_center = func(x0)
+    f_minus = func(x0 - eps)
+    return (f_plus - 2.0 * f_center + f_minus) / (eps * eps)
+
+
+def _grid_search_then_refine(func, bounds: Tuple[float, float],
+                              n_grid: int = 200,
+                              refine_width: float = 0.1) -> float:
+    """
+    Find the minimum of func over bounds using grid search + local refinement.
+
+    This is more robust than direct bounded optimization, especially for
+    concentrated log-likelihood functions that may have flat regions.
+    Consistent with the approach used in PySAL spreg.ML_Lag.
+
+    Parameters
+    ----------
+    func          : callable, negative log-likelihood
+    bounds        : (lower, upper) bounds for the parameter
+    n_grid        : number of grid points for initial search
+    refine_width  : width of refinement window around grid minimum
+
+    Returns
+    -------
+    float : optimised parameter value
+    """
+    grid = np.linspace(bounds[0], bounds[1], n_grid)
+    vals = np.array([func(r) for r in grid])
+    best_idx = np.argmin(vals)
+    x_init = grid[best_idx]
+
+    lo = max(x_init - refine_width, bounds[0])
+    hi = min(x_init + refine_width, bounds[1])
+    opt = optimize.minimize_scalar(func, bounds=(lo, hi), method="bounded")
+    return float(opt.x)
+
+
 def _simulation_se(S_draws: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Elhorst (2014) eq. 2.17: mean, SE, t-value from D simulation draws.
@@ -93,16 +145,15 @@ def _simulation_se(S_draws: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndar
 
 
 def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
-                      rho: np.ndarray, cov_params: np.ndarray,
+                      rho: float, cov_params: np.ndarray,
                       n: int, k: int, D: int = 1000,
                       seed: int = 0) -> dict:
     """
     Simulation-based inference for direct/indirect/total effects.
     Implements Elhorst (2014) eq. 2.16-2.17.
 
-    Speed: uses eigendecomposition + trace/rowsum tricks to avoid
-    building the full n×n matrix M_k per draw. O(n²) per draw instead
-    of O(n³).
+    Uses eigendecomposition + trace/rowsum tricks to avoid building the
+    full n×n matrix S_k(W) per draw. O(n²) per draw instead of O(n³).
 
     Parameters
     ----------
@@ -115,9 +166,13 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     D          : number of simulation draws (default 1000)
     """
     rng = np.random.default_rng(seed)
+
+    # Ensure positive semi-definiteness for Cholesky
+    cov_reg = cov_params + 1e-10 * np.eye(len(cov_params))
     try:
-        P = np.linalg.cholesky(cov_params + 1e-10 * np.eye(len(cov_params)))
+        P = np.linalg.cholesky(cov_reg)
     except np.linalg.LinAlgError:
+        # Fallback: use diagonal elements only
         P = np.diag(np.sqrt(np.maximum(np.diag(cov_params), 0)))
 
     p_dim = cov_params.shape[0]
@@ -134,9 +189,11 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     indirect_d = np.zeros((D, k))
     total_d    = np.zeros((D, k))
 
-    # ── Pre-compute eigendecomposition of W (done ONCE, reused every draw) ──
-    # (I - r·W)⁻¹ = V · diag(1/(1 - r·λ)) · V⁻¹
+    # Pre-compute eigendecomposition of W (done ONCE, reused every draw)
     eigvals_W, eigvecs_W = np.linalg.eig(W)
+    if np.max(np.abs(eigvals_W.imag)) > 1e-6:
+        warnings.warn("Weight matrix has non-trivial complex eigenvalues. "
+                      "Taking real parts.", UserWarning, stacklevel=2)
     eigvals_W = eigvals_W.real
     eigvecs_W = eigvecs_W.real
     try:
@@ -144,18 +201,12 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     except np.linalg.LinAlgError:
         eigvecs_inv = np.linalg.pinv(eigvecs_W)
 
-    # Pre-compute W-independent quantities used in trace/rowsum tricks
-    # S_k(W) = S_inv·(β_k·I + θ_k·W)
-    # trace(S_inv · I)  = sum of diag(S_inv)          → use eigvec formula
-    # trace(S_inv · W)  = sum_i (S_inv·W)_ii          → precompute S_inv·W diag
-    # 1'·S_inv·I·1  = sum(S_inv)
-    # 1'·S_inv·W·1  = 1'·(S_inv·W)·1 = sum(S_inv·W)
-    # We precompute V⁻¹·W·V to get W in eigenbasis (constant across draws)
-    W_eig    = eigvecs_inv @ W @ eigvecs_W   # W in eigen-basis (n×n, constant)
-    ones_n   = np.ones(n)
-    VinvW    = eigvecs_inv @ W               # (n,n) — precomputed once
-    Vinv_ones = eigvecs_inv @ ones_n         # (n,)  — precomputed once
+    # Pre-compute quantities constant across draws
+    ones_n    = np.ones(n)
+    VinvW     = eigvecs_inv @ W         # (n,n)
+    Vinv_ones = eigvecs_inv @ ones_n    # (n,)
 
+    valid_draws = 0
     for d in range(D):
         xi   = rng.standard_normal(p_dim)
         draw = P @ xi + center
@@ -163,66 +214,49 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
         b_d  = draw[1:k+1]
         t_d  = draw[k+1:] if has_theta else np.zeros(k)
 
-        denom = 1.0 - r_d * eigvals_W          # (n,)
+        denom = 1.0 - r_d * eigvals_W   # (n,)
         if np.any(np.abs(denom) < 1e-10):
             continue
 
-        inv_denom = 1.0 / denom                 # (n,)
+        inv_denom = 1.0 / denom          # (n,)
 
-        # ── Trace trick ──────────────────────────────────────────────────────
-        # S_inv = V · D_inv · V⁻¹   where D_inv = diag(inv_denom)
-        #
-        # trace(S_inv) = trace(V · D_inv · V⁻¹)
-        #              = sum_i [V⁻¹ · V]_ii * inv_denom_i   (cyclic trace)
-        #              = sum_i (V⁻¹·V)_ii · inv_denom_i
-        # But V⁻¹·V = I only if V is the true inverse basis.
-        # Easier: trace(S_inv) = sum_ij (V)_ij · (V⁻¹)_ji · inv_denom_j
-        #                      = sum_j inv_denom_j · (V⁻¹ @ V)_jj  ← = 1
-        # So: trace(S_inv) = sum_j inv_denom_j · [V⁻¹·V]_jj
-        # Since V⁻¹·V = I:  trace(S_inv) = sum(inv_denom)   ✓
-        #
-        # trace(S_inv · W):
-        # S_inv·W = V · D_inv · V⁻¹ · W = V · D_inv · W_eig_row
-        # where W_eig_row = V⁻¹·W·V in eigen-basis already computed
-        # trace(V · D_inv · W_eig · V⁻¹) but actually:
-        # trace(S_inv·W) = trace(V·D_inv·(V⁻¹·W·V)·V⁻¹·V)  -- messy
-        # Simpler: compute S_inv·W diagonal directly in O(n²)
-        # diag(S_inv·W) via: (V · diag(inv_denom) · V⁻¹) · W
-        #                   = column-scaled V times V⁻¹·W, take diagonal
-
-        # Compute diag(S_inv) and rowsum(S_inv) without building S_inv fully
         # S_inv = V · diag(inv_denom) · V⁻¹
-        # diag(S_inv)_i = sum_j V_ij * inv_denom_j * (V⁻¹)_ji
-        #               = (V * inv_denom[None,:]) row-dot (V⁻¹).T col
-        Vd   = eigvecs_W * inv_denom[np.newaxis, :]   # V scaled cols, (n,n)
+        Vd = eigvecs_W * inv_denom[np.newaxis, :]   # V with scaled cols (n,n)
 
-        # diag(S_inv) = row-wise dot of Vd and eigvecs_inv.T
+        # diag(S_inv) via einsum
         diag_Sinv = np.einsum('ij,ji->i', Vd, eigvecs_inv)  # (n,)
 
-        # rowsum(S_inv) · 1 = Vd @ (V⁻¹ @ 1)
-        rowsum_Sinv = Vd @ Vinv_ones                 # (n,)  — Vinv_ones precomputed
+        # rowsum(S_inv) · 1
+        rowsum_Sinv = Vd @ Vinv_ones                          # (n,)
 
-        # S_inv·W = Vd @ (V⁻¹·W)   — VinvW precomputed
-        SinvW  = Vd @ VinvW                          # (n,n)
-        diag_SinvW   = np.diag(SinvW)               # (n,)
-        rowsum_SinvW = SinvW @ ones_n                # (n,)
+        # S_inv · W
+        SinvW          = Vd @ VinvW                            # (n,n)
+        diag_SinvW     = np.diag(SinvW)                        # (n,)
+        rowsum_SinvW   = SinvW @ ones_n                        # (n,)
 
         for i in range(k):
-            # M_k = S_inv·(β_k·I + θ_k·W)
-            # direct  = trace(M_k)/n = (β_k·trace(S_inv) + θ_k·trace(S_inv·W))/n
-            # total   = 1'M_k1/n    = (β_k·sum(rowsum_Sinv) + θ_k·sum(rowsum_SinvW))/n
             b_i = b_d[i]
             t_i = t_d[i]
 
+            # Elhorst 2014 Table 2.1:
+            # M_k = S_inv · (β_k·I + θ_k·W)
+            # direct  = trace(M_k) / n
+            # total   = 1'·M_k·1 / n
             direct_d[d, i] = (b_i * np.sum(diag_Sinv) +
                                t_i * np.sum(diag_SinvW)) / n
             total_d[d, i]  = (b_i * np.sum(rowsum_Sinv) +
                                t_i * np.sum(rowsum_SinvW)) / n
             indirect_d[d, i] = total_d[d, i] - direct_d[d, i]
 
-    dir_mean,  dir_se,  dir_t  = _simulation_se(direct_d)
-    ind_mean,  ind_se,  ind_t  = _simulation_se(indirect_d)
-    tot_mean,  tot_se,  tot_t  = _simulation_se(total_d)
+        valid_draws += 1
+
+    if valid_draws < D * 0.5:
+        warnings.warn(f"Only {valid_draws}/{D} simulation draws were valid. "
+                      "Effect inference may be unreliable.", UserWarning, stacklevel=2)
+
+    dir_mean,  dir_se,  dir_t  = _simulation_se(direct_d[:valid_draws] if valid_draws < D else direct_d)
+    ind_mean,  ind_se,  ind_t  = _simulation_se(indirect_d[:valid_draws] if valid_draws < D else indirect_d)
+    tot_mean,  tot_se,  tot_t  = _simulation_se(total_d[:valid_draws] if valid_draws < D else total_d)
 
     return dict(
         direct=dir_mean,   direct_se=dir_se,   direct_t=dir_t,
@@ -231,6 +265,7 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
         direct_p  =2*stats.norm.sf(np.abs(dir_t)),
         indirect_p=2*stats.norm.sf(np.abs(ind_t)),
         total_p   =2*stats.norm.sf(np.abs(tot_t)),
+        n_valid_draws=valid_draws,
     )
 
 
@@ -369,14 +404,16 @@ class SpatialLagModel:
         self.results_ = None
 
     def fit(self, Y: np.ndarray, X: np.ndarray,
-            rho_bounds: Tuple[float,float] = (-0.99, 0.99),
+            rho_bounds: Tuple[float, float] = (-0.99, 0.99),
             n_draws: int = 1000) -> "SpatialLagModel":
         Y     = np.asarray(Y, dtype=float).ravel()
         X     = np.asarray(X, dtype=float)
         n, k  = X.shape
         X_aug = np.column_stack([np.ones(n), X])
         W     = self.W
-        ev_W  = np.linalg.eigvals(W).real
+
+        # Pre-compute eigenvalues for log-determinant (done once)
+        ev_W = np.linalg.eigvals(W).real
 
         def neg_ll(rho):
             A      = np.eye(n) - rho * W
@@ -384,36 +421,41 @@ class SpatialLagModel:
             beta   = np.linalg.lstsq(X_aug, AY, rcond=None)[0]
             resid  = AY - X_aug @ beta
             sigma2 = float(resid @ resid) / n
+            if sigma2 <= 0:
+                return 1e15
             log_det = float(np.sum(np.log(np.abs(1 - rho * ev_W))))
             return 0.5 * n * np.log(sigma2) - log_det
 
-        opt     = optimize.minimize_scalar(neg_ll, bounds=rho_bounds, method="bounded")
-        rho_hat = float(opt.x)
+        # FIX: Grid search + local refinement (robust ρ estimation)
+        rho_hat = _grid_search_then_refine(neg_ll, rho_bounds)
+
         A       = np.eye(n) - rho_hat * W
         AY      = A @ Y
         beta    = np.linalg.lstsq(X_aug, AY, rcond=None)[0]
         resid   = AY - X_aug @ beta
         sigma2  = float(resid @ resid) / (n - X_aug.shape[1])
 
-        # ML covariance via numerical Hessian of neg_ll for ρ;
-        # OLS covariance for β conditional on ρ̂
+        # FIX: SE(ρ) from SECOND derivative of neg_ll (Hessian), not first
+        hessian_rho = _numerical_hessian_scalar(neg_ll, rho_hat)
+        se_rho = 1.0 / np.sqrt(max(hessian_rho, 1e-12))
+
+        # Conditional OLS covariance for β given ρ̂
         ols_cov = sigma2 * np.linalg.pinv(X_aug.T @ X_aug)
-        # Approximate joint cov [rho, beta_X] — block diagonal (standard approximation)
-        d2 = optimize.approx_fprime([rho_hat], neg_ll, 1e-5)
-        se_rho = 1.0 / np.sqrt(max(float(d2[0]), 1e-12))
-        cov_joint = np.zeros((1+k, 1+k))
-        cov_joint[0, 0] = se_rho**2
+
+        # Joint covariance [rho, beta_X] (block-diagonal approximation)
+        cov_joint = np.zeros((1 + k, 1 + k))
+        cov_joint[0, 0]  = se_rho**2
         cov_joint[1:, 1:] = ols_cov[1:k+1, 1:k+1]
 
         eff = _effect_inference(W, beta[1:], np.zeros(k), rho_hat,
                                 cov_joint, n, k, D=n_draws)
 
-        # Standard errors for coefficient estimates
+        # Coefficient-level inference
         se_beta = np.sqrt(np.diag(ols_cov))[1:]
         t_beta  = beta[1:] / np.where(se_beta > 0, se_beta, np.nan)
         p_beta  = 2 * stats.t.sf(np.abs(t_beta), df=n - X_aug.shape[1])
-        t_rho   = rho_hat / se_rho
-        p_rho   = 2 * stats.norm.sf(abs(t_rho))
+        t_rho   = rho_hat / se_rho if se_rho > 0 else np.nan
+        p_rho   = 2 * stats.norm.sf(abs(t_rho)) if not np.isnan(t_rho) else np.nan
 
         self.results_ = {
             "model": "SAR", "rho": rho_hat, "rho_se": se_rho,
@@ -432,7 +474,6 @@ class SpatialLagModel:
 
     def print_summary(self, var_names=None):
         res = self.summary()
-        n_obs = len(res.get("beta", [])) + 1
         k = len(res["beta"])
         if var_names is None:
             var_names = [f"x{i+1}" for i in range(k)]
@@ -446,8 +487,8 @@ class SpatialLagModel:
         print(f"  {'Variable':<14} {'β':>9} {'SE':>9} {'t':>9} {'p':>8}  Sig")
         print(f"  {'─'*55}")
         for j, v in enumerate(var_names):
-            b = res['beta'][j]; se=res['beta_se'][j]
-            t=res['beta_t'][j]; p=res['beta_p'][j]
+            b = res['beta'][j]; se = res['beta_se'][j]
+            t = res['beta_t'][j]; p = res['beta_p'][j]
             print(f"  {v:<14} {b:>9.4f} {se:>9.4f} {t:>9.3f} {p:>8.4f}  {_format_stars(p)}")
         print_effects_table(res, var_names)
 
@@ -477,7 +518,7 @@ class SpatialErrorModel:
         self.results_ = None
 
     def fit(self, Y: np.ndarray, X: np.ndarray,
-            lam_bounds: Tuple[float,float] = (-0.99, 0.99)) -> "SpatialErrorModel":
+            lam_bounds: Tuple[float, float] = (-0.99, 0.99)) -> "SpatialErrorModel":
         Y     = np.asarray(Y, dtype=float).ravel()
         X     = np.asarray(X, dtype=float)
         n, k  = X.shape
@@ -491,11 +532,14 @@ class SpatialErrorModel:
             beta   = np.linalg.lstsq(BX, BY, rcond=None)[0]
             resid  = BY - BX @ beta
             sigma2 = float(resid @ resid) / n
+            if sigma2 <= 0:
+                return 1e15
             log_det = float(np.sum(np.log(np.abs(1 - lam * ev_W))))
             return 0.5 * n * np.log(sigma2) - log_det
 
-        opt     = optimize.minimize_scalar(neg_ll, bounds=lam_bounds, method="bounded")
-        lam_hat = float(opt.x)
+        # FIX: Grid search + local refinement
+        lam_hat = _grid_search_then_refine(neg_ll, lam_bounds)
+
         B       = np.eye(n) - lam_hat * W
         BY, BX  = B @ Y, B @ X_aug
         beta    = np.linalg.lstsq(BX, BY, rcond=None)[0]
@@ -507,10 +551,11 @@ class SpatialErrorModel:
         t_beta  = beta[1:] / np.where(se_beta > 0, se_beta, np.nan)
         p_beta  = 2 * stats.t.sf(np.abs(t_beta), df=n - X_aug.shape[1])
 
-        d2 = optimize.approx_fprime([lam_hat], neg_ll, 1e-5)
-        se_lam = 1.0 / np.sqrt(max(float(d2[0]), 1e-12))
-        t_lam  = lam_hat / se_lam
-        p_lam  = 2 * stats.norm.sf(abs(t_lam))
+        # FIX: SE(λ) from SECOND derivative (Hessian)
+        hessian_lam = _numerical_hessian_scalar(neg_ll, lam_hat)
+        se_lam = 1.0 / np.sqrt(max(hessian_lam, 1e-12))
+        t_lam  = lam_hat / se_lam if se_lam > 0 else np.nan
+        p_lam  = 2 * stats.norm.sf(abs(t_lam)) if not np.isnan(t_lam) else np.nan
 
         self.results_ = {
             "model": "SEM", "lambda": lam_hat,
@@ -546,8 +591,8 @@ class SpatialErrorModel:
         print(f"\n  {'Variable':<14} {'β':>9} {'SE':>9} {'t':>9} {'p':>8}  Sig")
         print(f"  {'─'*55}")
         for j, v in enumerate(var_names):
-            b=res['beta'][j]; se=res['beta_se'][j]
-            t=res['beta_t'][j]; p=res['beta_p'][j]
+            b = res['beta'][j]; se = res['beta_se'][j]
+            t = res['beta_t'][j]; p = res['beta_p'][j]
             print(f"  {v:<14} {b:>9.4f} {se:>9.4f} {t:>9.3f} {p:>8.4f}  {_format_stars(p)}")
 
 
@@ -576,7 +621,7 @@ class SDMModel:
         self.results_ = None
 
     def fit(self, Y: np.ndarray, X: np.ndarray,
-            rho_bounds: Tuple[float,float] = (-0.99, 0.99),
+            rho_bounds: Tuple[float, float] = (-0.99, 0.99),
             n_draws: int = 1000) -> "SDMModel":
         Y     = np.asarray(Y, dtype=float).ravel()
         X     = np.asarray(X, dtype=float)
@@ -592,11 +637,14 @@ class SDMModel:
             beta   = np.linalg.lstsq(X_aug, AY, rcond=None)[0]
             resid  = AY - X_aug @ beta
             sigma2 = float(resid @ resid) / n
+            if sigma2 <= 0:
+                return 1e15
             log_det = float(np.sum(np.log(np.abs(1 - rho * ev_W))))
             return 0.5 * n * np.log(sigma2) - log_det
 
-        opt     = optimize.minimize_scalar(neg_ll, bounds=rho_bounds, method="bounded")
-        rho_hat = float(opt.x)
+        # FIX: Grid search + local refinement for ρ
+        rho_hat = _grid_search_then_refine(neg_ll, rho_bounds)
+
         A       = np.eye(n) - rho_hat * W
         AY      = A @ Y
         beta    = np.linalg.lstsq(X_aug, AY, rcond=None)[0]
@@ -606,11 +654,13 @@ class SDMModel:
         beta_X = beta[1:k+1]
         theta  = beta[k+1:]
 
-        # Approximate joint covariance [rho, beta_X, theta]
+        # FIX: SE(ρ) from SECOND derivative (Hessian), not first
+        hessian_rho = _numerical_hessian_scalar(neg_ll, rho_hat)
+        se_rho = 1.0 / np.sqrt(max(hessian_rho, 1e-12))
+
+        # Joint covariance [rho, beta_X, theta]
         ols_cov = sigma2 * np.linalg.pinv(X_aug.T @ X_aug)
-        d2      = optimize.approx_fprime([rho_hat], neg_ll, 1e-5)
-        se_rho  = 1.0 / np.sqrt(max(float(d2[0]), 1e-12))
-        cov_joint = np.zeros((1+2*k, 1+2*k))
+        cov_joint = np.zeros((1 + 2*k, 1 + 2*k))
         cov_joint[0, 0]  = se_rho**2
         cov_joint[1:, 1:] = ols_cov[1:2*k+1, 1:2*k+1]
 
@@ -625,8 +675,8 @@ class SDMModel:
         t_th    = theta  / np.where(se_th > 0, se_th, np.nan)
         p_bX    = 2*stats.t.sf(np.abs(t_bX), df=n-X_aug.shape[1])
         p_th    = 2*stats.t.sf(np.abs(t_th), df=n-X_aug.shape[1])
-        t_rho   = rho_hat / se_rho
-        p_rho   = 2*stats.norm.sf(abs(t_rho))
+        t_rho   = rho_hat / se_rho if se_rho > 0 else np.nan
+        p_rho   = 2*stats.norm.sf(abs(t_rho)) if not np.isnan(t_rho) else np.nan
 
         self.results_ = {
             "model": "SDM", "rho": rho_hat, "rho_se": se_rho,
@@ -660,10 +710,10 @@ class SDMModel:
         print(f"  {'Variable':<14} {'β':>9} {'SE':>9} {'t':>9} {'p':>8}  {'θ(WX)':>9} {'SE':>9} {'t':>9} {'p':>8}")
         print(f"  {'─'*90}")
         for j, v in enumerate(var_names):
-            b=res['beta_X'][j]; sb=res['beta_X_se'][j]
-            tb=res['beta_X_t'][j]; pb=res['beta_X_p'][j]
-            t=res['theta_WX'][j]; st=res['theta_WX_se'][j]
-            tt=res['theta_WX_t'][j]; pt=res['theta_WX_p'][j]
+            b = res['beta_X'][j]; sb = res['beta_X_se'][j]
+            tb = res['beta_X_t'][j]; pb = res['beta_X_p'][j]
+            t = res['theta_WX'][j]; st = res['theta_WX_se'][j]
+            tt = res['theta_WX_t'][j]; pt = res['theta_WX_p'][j]
             print(f"  {v:<14} {b:>9.4f} {sb:>9.4f} {tb:>9.3f} {pb:>8.4f}{_format_stars(pb)}  "
                   f"{t:>9.4f} {st:>9.4f} {tt:>9.3f} {pt:>8.4f}{_format_stars(pt)}")
         print_effects_table(res, var_names)
