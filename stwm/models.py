@@ -116,20 +116,33 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     except np.linalg.LinAlgError:
         P = np.diag(np.sqrt(np.maximum(np.diag(cov_params), 0)))
 
-    p_dim  = cov_params.shape[0]
-    has_theta = len(theta) == k
+    p_dim = cov_params.shape[0]
+
+    # Determine whether theta is truly included based on cov_params size
+    # SAR: p_dim = 1+k  →  has_theta=False
+    # SDM: p_dim = 1+2k →  has_theta=True
+    has_theta = (p_dim == 1 + 2 * k)
+    if has_theta:
+        center = np.concatenate([[rho], beta_X, theta])
+    else:
+        center = np.concatenate([[rho], beta_X])
 
     direct_d   = np.zeros((D, k))
     indirect_d = np.zeros((D, k))
     total_d    = np.zeros((D, k))
 
-    p_dim_check = cov_params.shape[0]
-    if p_dim_check == 1 + len(beta_X) + len(theta):
-        center = np.concatenate([[rho], beta_X, theta])
-        has_theta = True
-    else:
-        center = np.concatenate([[rho], beta_X])
-        has_theta = False
+    # Pre-compute eigendecomposition of W once — reused across all draws.
+    # (I - rW)^{-1} = V · diag(1/(1 - r·λ)) · V^{-1}
+    # This avoids a full n×n matrix inversion for every draw (major speed-up).
+    eigvals_W, eigvecs_W = np.linalg.eig(W)
+    eigvals_W = eigvals_W.real
+    eigvecs_W = eigvecs_W.real
+    try:
+        eigvecs_inv = np.linalg.inv(eigvecs_W)
+    except np.linalg.LinAlgError:
+        eigvecs_inv = np.linalg.pinv(eigvecs_W)
+    ones_n = np.ones(n)
+    eye_n  = np.eye(n)
 
     for d in range(D):
         xi   = rng.standard_normal(p_dim)
@@ -138,17 +151,17 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
         b_d  = draw[1:k+1]
         t_d  = draw[k+1:] if has_theta else np.zeros(k)
 
-        A_d = np.eye(n) - r_d * W
-        try:
-            S_inv = np.linalg.inv(A_d)
-        except np.linalg.LinAlgError:
+        denom = 1.0 - r_d * eigvals_W
+        if np.any(np.abs(denom) < 1e-10):
             continue
+        # (I - r_d W)^{-1}
+        S_inv = eigvecs_W @ np.diag(1.0 / denom) @ eigvecs_inv
 
         for i in range(k):
             # S_k(W) = (I-δW)^{-1}(I·β_k + W·θ_k)  [Elhorst 2014, eq.2.13]
-            M_k = S_inv @ (np.eye(n) * b_d[i] + W * t_d[i])
+            M_k = S_inv @ (eye_n * b_d[i] + W * t_d[i])
             direct_d[d, i]   = np.trace(M_k) / n
-            total_d[d, i]    = np.ones(n) @ M_k @ np.ones(n) / n
+            total_d[d, i]    = ones_n @ M_k @ ones_n / n
             indirect_d[d, i] = total_d[d, i] - direct_d[d, i]
 
     dir_mean,  dir_se,  dir_t  = _simulation_se(direct_d)
