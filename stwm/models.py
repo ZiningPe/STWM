@@ -123,14 +123,13 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     indirect_d = np.zeros((D, k))
     total_d    = np.zeros((D, k))
 
-    # center must match cov_params dimension
-    # has_theta=True but theta=zeros: SAR passes zeros(k) → still concat to keep consistent
-    # Fix: derive center length from cov_params shape, not has_theta
     p_dim_check = cov_params.shape[0]
     if p_dim_check == 1 + len(beta_X) + len(theta):
         center = np.concatenate([[rho], beta_X, theta])
+        has_theta = True
     else:
         center = np.concatenate([[rho], beta_X])
+        has_theta = False
 
     for d in range(D):
         xi   = rng.standard_normal(p_dim)
