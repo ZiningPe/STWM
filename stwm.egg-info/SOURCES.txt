@@ -1,0 +1,15 @@
+README.md
+setup.py
+stwm/__init__.py
+stwm/endogeneity.py
+stwm/heterogeneity.py
+stwm/models.py
+stwm/robustness.py
+stwm/simulation.py
+stwm/stwm_core.py
+stwm/temporal_weights.py
+stwm.egg-info/PKG-INFO
+stwm.egg-info/SOURCES.txt
+stwm.egg-info/dependency_links.txt
+stwm.egg-info/requires.txt
+stwm.egg-info/top_level.txt

@@ -1,67 +1,49 @@
 """
 temporal_weights.py
 -------------------
-Construct Time Weight Matrices (TWM) from spatial autocorrelation statistics.
+Time Weight Matrix (TWM) construction from multiple temporal statistics.
 
-Core Innovation
----------------
-Rather than imposing arbitrary temporal decay functions, this module derives
-temporal propagation "memory" from the year-to-year evolution of observed
-spatial autocorrelation statistics (Moran's I or Geary's C).
+Five approaches to encode temporal dependence (choose based on theory):
 
-The key idea: if spatial clustering in period s is a precursor to clustering
-in period t, the ratio I_t / I_s encodes the relative strength of that
-temporal link. Row-standardisation ensures each row sums to 1.
+┌─────────────────────┬──────────────────────────────────────────────────────┐
+│ Method              │ Economic Interpretation                               │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ 1. Moran's I ratio  │ Carry-forward of global spatial clustering strength  │
+│ 2. Geary's C ratio  │ Carry-forward of local spatial dissimilarity         │
+│ 3. Getis-Ord G*     │ Hot-spot concentration ratio (local clustering)      │
+│ 4. Spatial Gini     │ Concentration/inequality of spatial distribution     │
+│ 5. Decay-based      │ Agnostic benchmark: exp / linear / power decay       │
+└─────────────────────┴──────────────────────────────────────────────────────┘
 
-Mathematical Formulation
-------------------------
-Given a sequence of T annual statistics {a_1, a_2, ..., a_T}:
+Mathematical Formulation (same for all ratio-based methods)
+------------------------------------------------------------
+Given a T-length sequence of statistics {a_1, ..., a_T}:
 
     Raw TWM entry:
-        TWM[t, s] = a_t / a_s    for s < t   (lower triangle)
+        TWM[t, s] = a_t / a_s    for s < t  (lower triangle, causal)
         TWM[t, t] = 1            (diagonal)
-        TWM[t, s] = 0            for s > t   (upper triangle, causal)
+        TWM[t, s] = 0            for s > t  (upper triangle = no future info)
 
-    After winsorisation at quantile q and clipping negatives to 0:
-        TWM[t, s] ← clip(TWM[t, s], 0, Q_q(|TWM|))
+    Processing pipeline:
+        Step 1: Replace |denominator| < min_abs with sign * min_abs
+        Step 2: Winsorise at quantile q: clip(., 0, Q_q(|entries|))
+        Step 3: Clip negatives to 0
+        Step 4: Row-standardise: TWM[t,:] /= sum(TWM[t,:])
 
-    Row-standardisation:
-        TWM[t, :] ← TWM[t, :] / sum(TWM[t, :])
+Admissibility Conditions (Elhorst 2014, Section 2.2)
+-----------------------------------------------------
+A valid weight matrix W must satisfy:
+  (1) All entries ≥ 0
+  (2) Each row sums to 1  (row-standardisation)
+  (3) Spectral radius ρ(W) < 1  (required for (I−δW)⁻¹ to exist)
+  (4) No NaN or Inf
 
-Admissibility Conditions
-------------------------
-A valid TWM must satisfy:
-  (1) All entries ≥ 0                (non-negativity)
-  (2) Each row sums to 1             (row-standardisation)
-  (3) Spectral radius ρ(TWM) < 1    (stability for spatial lag models)
-  (4) No NaN or Inf entries
-
-The function `twm_stability_check` verifies all four conditions.
-
-Decay-Based Alternative
------------------------
-`build_twm_decay` provides conventional decay-based TWMs for comparison:
-  - Exponential:  w[t,s] = exp(-λ(t−s))
-  - Linear:       w[t,s] = max(0, 1 − λ(t−s))
-  - Power:        w[t,s] = (t−s)^{−λ}
-
-Illustrative Example (T=3)
---------------------------
-    stats = [0.40, 0.50, 0.30]
-
-    Raw lower-triangle:
-        TWM[1,0] = 0.50 / 0.40 = 1.25
-        TWM[2,0] = 0.30 / 0.40 = 0.75
-        TWM[2,1] = 0.30 / 0.50 = 0.60
-
-    After row-standardisation:
-        row 0: [1.00,  0,    0   ]
-        row 1: [0.56,  0.44, 0   ]  (1.25 / 2.25, 1.00 / 2.25)
-        row 2: [0.36,  0.29, 0.36]  ... (normalised)
-
-    Economic interpretation: TWM[t,s] represents the relative weight of
-    period s's spatial clustering pattern in predicting period t's pattern.
-    Higher ratio → stronger temporal carry-forward from s to t.
+References
+----------
+Moran, P. A. P. (1950). Biometrika, 37, 17–23.
+Geary, R. C. (1954). The Incorporated Statistician, 5, 115–145.
+Getis, A., & Ord, J. K. (1992). Geographical Analysis, 24(3), 189–206.
+Elhorst, J. P. (2014). Spatial Econometrics. Springer.
 """
 
 import numpy as np
@@ -70,64 +52,102 @@ from typing import Literal
 
 
 # ---------------------------------------------------------------------------
-# 1.  Spatial autocorrelation statistics
+# Internal shared builder
+# ---------------------------------------------------------------------------
+
+def _ratio_matrix(stats: np.ndarray,
+                  winsorize_quantile: float,
+                  min_abs: float) -> np.ndarray:
+    """Lower-triangular ratio TWM with winsorisation and row-standardisation."""
+    T   = len(stats)
+    mat = np.zeros((T, T))
+    for t in range(T):
+        for s in range(t):
+            denom = stats[s]
+            if abs(denom) < min_abs:
+                denom = (np.sign(denom) * min_abs) if denom != 0 else min_abs
+            mat[t, s] = stats[t] / denom
+        mat[t, t] = 1.0
+    off = mat[mat != 0]
+    if len(off) > 0:
+        cap = np.quantile(np.abs(off), winsorize_quantile)
+        mat = np.clip(mat, -cap, cap)
+    mat = np.where(mat < 0, 0.0, mat)
+    rs  = mat.sum(axis=1, keepdims=True)
+    rs  = np.where(rs == 0, 1.0, rs)
+    return mat / rs
+
+
+def _warn_near_zero(stats: np.ndarray, name: str, threshold: float = 0.05):
+    idx = np.where(np.abs(stats) < threshold)[0]
+    if len(idx) > 0:
+        warnings.warn(
+            f"{name} near zero at t={idx.tolist()}. "
+            "Ratio TWM may be unstable; winsorisation applied.",
+            UserWarning, stacklevel=3)
+
+
+# ---------------------------------------------------------------------------
+# 1. Moran's I
 # ---------------------------------------------------------------------------
 
 def compute_morans_i(y: np.ndarray, W: np.ndarray) -> float:
     """
-    Compute Global Moran's I.
+    Global Moran's I (Moran 1950).
 
-    Formula
-    -------
-        I = (n / S_0) * (z' W z) / (z' z)
+    Formula:
+        I = (n / S₀) · (z'Wz) / (z'z)
 
-    where:
-        z  = y − ȳ  (mean-centred variable)
-        S_0 = sum of all weights in W
-        n   = number of observations
+    where z = y − ȳ, S₀ = Σᵢⱼ wᵢⱼ.
 
-    Range: approximately [−1, 1]
-        I > 0 → positive spatial autocorrelation (clustering)
-        I < 0 → negative spatial autocorrelation (dispersion)
-        I ≈ E[I] = −1/(n−1) → spatial randomness
-
-    Parameters
-    ----------
-    y : (n,) array   — observed variable
-    W : (n,n) array  — row-standardised spatial weight matrix
-
-    Returns
-    -------
-    float : Moran's I
+    Range ≈ [−1, 1]:  I > 0 → clustering,  I < 0 → dispersion.
     """
     n  = len(y)
     z  = y - y.mean()
-    Wz = W @ z
     S0 = W.sum()
-    return float(n * (z @ Wz) / (S0 * (z @ z)))
+    return float(n * (z @ (W @ z)) / (S0 * (z @ z)))
 
 
-def compute_geary_c(y: np.ndarray, W: np.ndarray) -> float:
+def build_twm_morans(morans_sequence: np.ndarray,
+                     winsorize_quantile: float = 0.95,
+                     min_abs: float = 1e-3) -> np.ndarray:
     """
-    Compute Global Geary's C.
+    TWM from Moran's I sequence.
 
-    Formula
-    -------
-        C = [(n−1) * Σ_ij w_ij (y_i − y_j)²] / [2 S_0 * Σ_i (y_i − ȳ)²]
+    TWM[t, s] = I_t / I_s    (s < t)
 
-    Range: (0, 2)
-        C < 1 → positive spatial autocorrelation
-        C ≈ 1 → spatial randomness
-        C > 1 → negative spatial autocorrelation
+    Economic interpretation: periods with higher spatial clustering relative
+    to an earlier period receive stronger temporal weight. Captures how the
+    evolution of global spatial agglomeration propagates forward in time.
 
     Parameters
     ----------
-    y : (n,) array
-    W : (n,n) array  — row-standardised
+    morans_sequence    : (T,) annual Moran's I values
+    winsorize_quantile : cap for extreme ratios (default 0.95)
+    min_abs            : min |denominator| to avoid division explosion
 
     Returns
     -------
-    float : Geary's C
+    (T, T) row-standardised lower-triangular TWM
+    """
+    stats = np.asarray(morans_sequence, float)
+    _warn_near_zero(stats, "Moran's I")
+    return _ratio_matrix(stats, winsorize_quantile, min_abs)
+
+
+# ---------------------------------------------------------------------------
+# 2. Geary's C
+# ---------------------------------------------------------------------------
+
+def compute_geary_c(y: np.ndarray, W: np.ndarray) -> float:
+    """
+    Global Geary's C (Geary 1954).
+
+    Formula:
+        C = [(n−1) · Σᵢⱼ wᵢⱼ(yᵢ−yⱼ)²] / [2S₀ · Σᵢ(yᵢ−ȳ)²]
+
+    Range (0, 2):  C < 1 → clustering,  C = 1 → random,  C > 1 → dispersion.
+    (Note: inverse direction from Moran's I)
     """
     n    = len(y)
     S0   = W.sum()
@@ -137,123 +157,154 @@ def compute_geary_c(y: np.ndarray, W: np.ndarray) -> float:
     return num / den
 
 
-# ---------------------------------------------------------------------------
-# 2.  TWM from autocorrelation sequences
-# ---------------------------------------------------------------------------
-
-def _ratio_matrix(stats: np.ndarray,
-                  winsorize_quantile: float,
-                  min_abs: float) -> np.ndarray:
-    """
-    Internal: build a lower-triangular ratio matrix and row-standardise.
-
-    Stability rules applied before row-standardisation:
-      1. |denominator| < min_abs  →  replace with sign * min_abs
-      2. All ratios winsorised to [0, Q_{winsorize_quantile}(|ratios|)]
-      3. Negative entries clipped to 0
-    """
-    T   = len(stats)
-    mat = np.zeros((T, T))
-
-    for t in range(T):
-        for s in range(t):
-            denom = stats[s]
-            if abs(denom) < min_abs:
-                denom = np.sign(denom) * min_abs if denom != 0 else min_abs
-            mat[t, s] = stats[t] / denom
-        mat[t, t] = 1.0
-
-    # Winsorise
-    off = mat[mat != 0]
-    if len(off) > 0:
-        cap = np.quantile(np.abs(off), winsorize_quantile)
-        mat = np.clip(mat, -cap, cap)
-
-    # Clip negatives
-    mat = np.where(mat < 0, 0.0, mat)
-
-    # Row-standardise
-    rs = mat.sum(axis=1, keepdims=True)
-    rs = np.where(rs == 0, 1.0, rs)
-    return mat / rs
-
-
-def build_twm_morans(morans_sequence: np.ndarray,
-                     winsorize_quantile: float = 0.95,
-                     min_abs: float = 1e-3) -> np.ndarray:
-    """
-    Build a Time Weight Matrix (TWM) from a sequence of Moran's I values.
-
-    Formula (element-wise, before row-standardisation):
-        TWM[t, s] = I_t / I_s    for s < t
-        TWM[t, t] = 1
-        TWM[t, s] = 0            for s > t
-
-    Parameters
-    ----------
-    morans_sequence     : (T,) array of annual Moran's I values
-    winsorize_quantile  : upper quantile cap for extreme ratios (default 0.95)
-    min_abs             : minimum absolute denominator, prevents ratio explosion
-
-    Returns
-    -------
-    TWM : (T, T) row-standardised lower-triangular matrix
-    """
-    stats = np.asarray(morans_sequence, dtype=float)
-    _warn_near_zero(stats, "Moran's I")
-    return _ratio_matrix(stats, winsorize_quantile, min_abs)
-
-
 def build_twm_gearyc(gearyc_sequence: np.ndarray,
                      winsorize_quantile: float = 0.95,
                      min_abs: float = 1e-3) -> np.ndarray:
     """
-    Build a Time Weight Matrix (TWM) from a sequence of Geary's C values.
+    TWM from Geary's C sequence.
 
-    Transformation applied before ratio construction:
-        a_t = 2 − C_t
+    Transformation: a_t = 2 − C_t  (re-scales so higher = more clustering)
+    TWM[t, s] = (2 − C_t) / (2 − C_s)
 
-    This maps Geary's C (where lower values indicate stronger clustering)
-    to a scale consistent with Moran's I (higher value = stronger clustering).
-
-    Formula (element-wise, before row-standardisation):
-        TWM[t, s] = (2 − C_t) / (2 − C_s)    for s < t
-
-    Parameters
-    ----------
-    gearyc_sequence    : (T,) array of annual Geary's C values
-    winsorize_quantile : upper quantile cap (default 0.95)
-    min_abs            : minimum absolute denominator (default 1e-3)
+    Economic interpretation: captures local-level spatial heterogeneity
+    dynamics. Complements Moran's I (which is a global measure).
+    Geary's C is more sensitive to local spatial differences.
 
     Returns
     -------
-    TWM : (T, T) row-standardised lower-triangular matrix
+    (T, T) row-standardised lower-triangular TWM
     """
-    stats = np.asarray(gearyc_sequence, dtype=float)
+    stats = np.asarray(gearyc_sequence, float)
     transformed = 2.0 - stats
-    _warn_near_zero(transformed, "Geary's C (transformed as 2−C)")
+    _warn_near_zero(transformed, "Geary's C (2−C)")
     return _ratio_matrix(transformed, winsorize_quantile, min_abs)
 
 
 # ---------------------------------------------------------------------------
-# 3.  Decay-based TWM (benchmark / robustness)
+# 3. Getis-Ord G* (hot-spot concentration)
+# ---------------------------------------------------------------------------
+
+def compute_getis_ord_g(y: np.ndarray, W: np.ndarray) -> float:
+    """
+    Global Getis-Ord G statistic (Getis & Ord 1992).
+
+    Formula:
+        G = Σᵢⱼ wᵢⱼ yᵢ yⱼ / Σᵢⱼ yᵢ yⱼ   (i ≠ j)
+
+    Captures the concentration of high values near other high values
+    (hot-spot clustering), distinct from Moran's I which measures
+    clustering of all values relative to the mean.
+
+    Requires y ≥ 0.
+    """
+    if np.any(y < 0):
+        warnings.warn("Getis-Ord G requires y ≥ 0. Shifting y = y − min(y).",
+                      UserWarning, stacklevel=2)
+        y = y - y.min()
+    n = len(y)
+    # Remove diagonal (i ≠ j)
+    W_nodiag = W * (1 - np.eye(n))
+    num = float(W_nodiag @ y @ y)
+    outer = np.outer(y, y)
+    den = float((outer * (1 - np.eye(n))).sum())
+    if den < 1e-12:
+        return 0.0
+    return num / den
+
+
+def build_twm_getis_ord(g_sequence: np.ndarray,
+                         winsorize_quantile: float = 0.95,
+                         min_abs: float = 1e-3) -> np.ndarray:
+    """
+    TWM from Getis-Ord G sequence.
+
+    TWM[t, s] = G_t / G_s
+
+    Economic interpretation: tracks temporal evolution of hot-spot
+    concentration. Particularly useful when the research question
+    concerns spatial concentration of high-value activities
+    (e.g. industrial clusters, patent hubs). Moran's I measures
+    general clustering; G specifically measures co-location of HIGH values.
+
+    Returns
+    -------
+    (T, T) row-standardised lower-triangular TWM
+    """
+    stats = np.asarray(g_sequence, float)
+    _warn_near_zero(stats, "Getis-Ord G")
+    return _ratio_matrix(stats, winsorize_quantile, min_abs)
+
+
+# ---------------------------------------------------------------------------
+# 4. Spatial Gini coefficient
+# ---------------------------------------------------------------------------
+
+def compute_spatial_gini(y: np.ndarray, W: np.ndarray) -> float:
+    """
+    Spatial Gini coefficient.
+
+    Formula:
+        SG = Σᵢⱼ wᵢⱼ |yᵢ − yⱼ| / (2n²·ȳ)
+
+    Measures spatial inequality — how concentrated is the variable
+    across space, weighted by spatial proximity.
+
+    Range [0, 1]: 0 = perfect equality, 1 = extreme concentration.
+    Unlike Moran's I and Geary's C, Gini focuses on distributional
+    inequality rather than clustering direction.
+    """
+    n    = len(y)
+    ybar = y.mean()
+    if ybar == 0:
+        return 0.0
+    diff = np.abs(np.subtract.outer(y, y))
+    return float((W * diff).sum()) / (2 * n**2 * ybar)
+
+
+def build_twm_spatial_gini(gini_sequence: np.ndarray,
+                            winsorize_quantile: float = 0.95,
+                            min_abs: float = 1e-3) -> np.ndarray:
+    """
+    TWM from Spatial Gini sequence.
+
+    TWM[t, s] = SG_t / SG_s
+
+    Economic interpretation: tracks temporal evolution of spatial
+    inequality. If your research question involves convergence/divergence
+    of regions over time, the Gini-based TWM captures whether the
+    current distribution is more or less unequal than past periods.
+
+    Particularly suitable for green innovation studies where
+    regional inequality in patent activity changes over policy periods.
+
+    Returns
+    -------
+    (T, T) row-standardised lower-triangular TWM
+    """
+    stats = np.asarray(gini_sequence, float)
+    _warn_near_zero(stats, "Spatial Gini")
+    return _ratio_matrix(stats, winsorize_quantile, min_abs)
+
+
+# ---------------------------------------------------------------------------
+# 5. Decay-based TWM (benchmark)
 # ---------------------------------------------------------------------------
 
 def build_twm_decay(T: int,
                     decay_type: Literal["exponential", "linear", "power"] = "exponential",
                     param: float = 0.5) -> np.ndarray:
     """
-    Build a conventional decay-based Time Weight Matrix (benchmark).
+    Benchmark decay-based TWM (no data-driven component).
 
-    Use this to compare against the autocorrelation-derived TWM, or as
-    a robustness check when Moran's I / Geary's C data are unavailable.
+    Formulas (before row-standardisation):
+        Exponential : w[t,s] = exp(−λ(t−s))
+        Linear      : w[t,s] = max(0, 1 − λ(t−s))
+        Power       : w[t,s] = (t−s)^{−λ}  for t > s
 
-    Formulas (before row-standardisation)
-    --------------------------------------
-    Exponential:    w[t,s] = exp(−λ · (t−s))
-    Linear:         w[t,s] = max(0,  1 − λ · (t−s))
-    Power:          w[t,s] = (t−s)^{−λ}              for t > s
-    Diagonal:       w[t,t] = 1
+    Use for:
+      - Robustness comparison against data-driven TWMs
+      - Sensitivity analysis to choice of λ
+      - Situations where no annual statistics are available
 
     Parameters
     ----------
@@ -263,7 +314,7 @@ def build_twm_decay(T: int,
 
     Returns
     -------
-    TWM : (T, T) row-standardised lower-triangular matrix
+    (T, T) row-standardised lower-triangular TWM
     """
     mat = np.zeros((T, T))
     for t in range(T):
@@ -278,75 +329,65 @@ def build_twm_decay(T: int,
             elif decay_type == "power":
                 mat[t, s] = lag ** (-param)
             else:
-                raise ValueError(f"Unknown decay_type: '{decay_type}'. "
-                                 "Choose 'exponential', 'linear', or 'power'.")
+                raise ValueError(f"Unknown decay_type: '{decay_type}'.")
     rs = mat.sum(axis=1, keepdims=True)
     rs = np.where(rs == 0, 1.0, rs)
     return mat / rs
 
 
 # ---------------------------------------------------------------------------
-# 4.  Admissibility check
+# Admissibility check
 # ---------------------------------------------------------------------------
 
-def twm_stability_check(TWM: np.ndarray,
-                        rho_max: float = 0.99) -> dict:
+def twm_stability_check(TWM: np.ndarray, rho_max: float = 0.99) -> dict:
     """
-    Verify admissibility conditions for a TWM.
+    Verify all admissibility conditions for a TWM.
 
-    Checks
-    ------
-    (1) Non-negativity:       all entries ≥ 0
-    (2) Row-standardisation:  each row sums to 1 (tolerance 1e-6)
-    (3) Spectral radius:      max|eigenvalue| < rho_max
-    (4) Finite entries:       no NaN or Inf
-
-    Parameters
-    ----------
-    TWM     : (T, T) time weight matrix
-    rho_max : maximum allowed spectral radius (default 0.99)
+    Checks:
+      (1) Non-negativity       : all entries ≥ 0
+      (2) Row-standardisation  : each row sums to 1 (tol 1e-6)
+      (3) Spectral radius      : max|λ| < rho_max
+      (4) No NaN/Inf
 
     Returns
     -------
-    dict : {
-        'non_negative'    : bool,
-        'row_standardised': bool,
-        'spectral_radius' : float,
-        'stable'          : bool,
-        'has_nan_inf'     : bool,
-        'passed'          : bool   ← True only if all four checks pass
-    }
+    dict with keys: non_negative, row_standardised, spectral_radius,
+                    stable, has_nan_inf, passed
     """
     non_neg  = bool(np.all(TWM >= 0))
     row_std  = bool(np.allclose(TWM.sum(axis=1), 1.0, atol=1e-6))
-    eigvals  = np.linalg.eigvals(TWM)
-    spec_rad = float(np.max(np.abs(eigvals)))
+    spec_rad = float(np.max(np.abs(np.linalg.eigvals(TWM))))
     stable   = spec_rad < rho_max
     has_nan  = bool(np.any(~np.isfinite(TWM)))
     passed   = non_neg and row_std and stable and (not has_nan)
-
-    result = {
-        "non_negative"    : non_neg,
-        "row_standardised": row_std,
-        "spectral_radius" : round(spec_rad, 6),
-        "stable"          : stable,
-        "has_nan_inf"     : has_nan,
-        "passed"          : passed,
-    }
+    result   = dict(non_negative=non_neg, row_standardised=row_std,
+                    spectral_radius=round(spec_rad, 6), stable=stable,
+                    has_nan_inf=has_nan, passed=passed)
     if not passed:
-        warnings.warn(f"TWM admissibility check FAILED: {result}", stacklevel=2)
+        warnings.warn(f"TWM admissibility FAILED: {result}", stacklevel=2)
     return result
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Convenience: compute all four statistics for a given year's data
 # ---------------------------------------------------------------------------
 
-def _warn_near_zero(stats: np.ndarray, name: str, threshold: float = 0.05):
-    idx = np.where(np.abs(stats) < threshold)[0]
-    if len(idx) > 0:
-        warnings.warn(
-            f"{name} is near zero at time indices {idx.tolist()}. "
-            "Ratio-based TWM may be unstable; winsorisation will be applied.",
-            UserWarning, stacklevel=3,
-        )
+def compute_all_temporal_stats(y: np.ndarray, W: np.ndarray) -> dict:
+    """
+    Compute all four temporal statistics for one cross-section.
+
+    Parameters
+    ----------
+    y : (n,) observed variable for one year
+    W : (n,n) row-standardised spatial weight matrix
+
+    Returns
+    -------
+    dict : {morans_i, geary_c, getis_g, spatial_gini}
+    """
+    return dict(
+        morans_i    = compute_morans_i(y, W),
+        geary_c     = compute_geary_c(y, W),
+        getis_g     = compute_getis_ord_g(y, W),
+        spatial_gini= compute_spatial_gini(y, W),
+    )
