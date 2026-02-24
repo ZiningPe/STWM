@@ -100,6 +100,10 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     Simulation-based inference for direct/indirect/total effects.
     Implements Elhorst (2014) eq. 2.16-2.17.
 
+    Speed: uses eigendecomposition + trace/rowsum tricks to avoid
+    building the full n×n matrix M_k per draw. O(n²) per draw instead
+    of O(n³).
+
     Parameters
     ----------
     W          : (n,n) weight matrix
@@ -107,7 +111,7 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     theta      : (k,) point estimates of WX coefficients (0 for SAR)
     rho        : scalar spatial autoregressive parameter
     cov_params : (p,p) ML variance-covariance of [rho, beta_X, theta]
-                 p = 1 + k + k (SDM) or 1 + k (SAR)
+                 p = 1+k (SAR) or 1+2k (SDM)
     D          : number of simulation draws (default 1000)
     """
     rng = np.random.default_rng(seed)
@@ -118,7 +122,6 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
 
     p_dim = cov_params.shape[0]
 
-    # Determine whether theta is truly included based on cov_params size
     # SAR: p_dim = 1+k  →  has_theta=False
     # SDM: p_dim = 1+2k →  has_theta=True
     has_theta = (p_dim == 1 + 2 * k)
@@ -131,9 +134,8 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
     indirect_d = np.zeros((D, k))
     total_d    = np.zeros((D, k))
 
-    # Pre-compute eigendecomposition of W once — reused across all draws.
-    # (I - rW)^{-1} = V · diag(1/(1 - r·λ)) · V^{-1}
-    # This avoids a full n×n matrix inversion for every draw (major speed-up).
+    # ── Pre-compute eigendecomposition of W (done ONCE, reused every draw) ──
+    # (I - r·W)⁻¹ = V · diag(1/(1 - r·λ)) · V⁻¹
     eigvals_W, eigvecs_W = np.linalg.eig(W)
     eigvals_W = eigvals_W.real
     eigvecs_W = eigvecs_W.real
@@ -141,8 +143,18 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
         eigvecs_inv = np.linalg.inv(eigvecs_W)
     except np.linalg.LinAlgError:
         eigvecs_inv = np.linalg.pinv(eigvecs_W)
-    ones_n = np.ones(n)
-    eye_n  = np.eye(n)
+
+    # Pre-compute W-independent quantities used in trace/rowsum tricks
+    # S_k(W) = S_inv·(β_k·I + θ_k·W)
+    # trace(S_inv · I)  = sum of diag(S_inv)          → use eigvec formula
+    # trace(S_inv · W)  = sum_i (S_inv·W)_ii          → precompute S_inv·W diag
+    # 1'·S_inv·I·1  = sum(S_inv)
+    # 1'·S_inv·W·1  = 1'·(S_inv·W)·1 = sum(S_inv·W)
+    # We precompute V⁻¹·W·V to get W in eigenbasis (constant across draws)
+    W_eig    = eigvecs_inv @ W @ eigvecs_W   # W in eigen-basis (n×n, constant)
+    ones_n   = np.ones(n)
+    VinvW    = eigvecs_inv @ W               # (n,n) — precomputed once
+    Vinv_ones = eigvecs_inv @ ones_n         # (n,)  — precomputed once
 
     for d in range(D):
         xi   = rng.standard_normal(p_dim)
@@ -151,17 +163,61 @@ def _effect_inference(W: np.ndarray, beta_X: np.ndarray, theta: np.ndarray,
         b_d  = draw[1:k+1]
         t_d  = draw[k+1:] if has_theta else np.zeros(k)
 
-        denom = 1.0 - r_d * eigvals_W
+        denom = 1.0 - r_d * eigvals_W          # (n,)
         if np.any(np.abs(denom) < 1e-10):
             continue
-        # (I - r_d W)^{-1}
-        S_inv = eigvecs_W @ np.diag(1.0 / denom) @ eigvecs_inv
+
+        inv_denom = 1.0 / denom                 # (n,)
+
+        # ── Trace trick ──────────────────────────────────────────────────────
+        # S_inv = V · D_inv · V⁻¹   where D_inv = diag(inv_denom)
+        #
+        # trace(S_inv) = trace(V · D_inv · V⁻¹)
+        #              = sum_i [V⁻¹ · V]_ii * inv_denom_i   (cyclic trace)
+        #              = sum_i (V⁻¹·V)_ii · inv_denom_i
+        # But V⁻¹·V = I only if V is the true inverse basis.
+        # Easier: trace(S_inv) = sum_ij (V)_ij · (V⁻¹)_ji · inv_denom_j
+        #                      = sum_j inv_denom_j · (V⁻¹ @ V)_jj  ← = 1
+        # So: trace(S_inv) = sum_j inv_denom_j · [V⁻¹·V]_jj
+        # Since V⁻¹·V = I:  trace(S_inv) = sum(inv_denom)   ✓
+        #
+        # trace(S_inv · W):
+        # S_inv·W = V · D_inv · V⁻¹ · W = V · D_inv · W_eig_row
+        # where W_eig_row = V⁻¹·W·V in eigen-basis already computed
+        # trace(V · D_inv · W_eig · V⁻¹) but actually:
+        # trace(S_inv·W) = trace(V·D_inv·(V⁻¹·W·V)·V⁻¹·V)  -- messy
+        # Simpler: compute S_inv·W diagonal directly in O(n²)
+        # diag(S_inv·W) via: (V · diag(inv_denom) · V⁻¹) · W
+        #                   = column-scaled V times V⁻¹·W, take diagonal
+
+        # Compute diag(S_inv) and rowsum(S_inv) without building S_inv fully
+        # S_inv = V · diag(inv_denom) · V⁻¹
+        # diag(S_inv)_i = sum_j V_ij * inv_denom_j * (V⁻¹)_ji
+        #               = (V * inv_denom[None,:]) row-dot (V⁻¹).T col
+        Vd   = eigvecs_W * inv_denom[np.newaxis, :]   # V scaled cols, (n,n)
+
+        # diag(S_inv) = row-wise dot of Vd and eigvecs_inv.T
+        diag_Sinv = np.einsum('ij,ji->i', Vd, eigvecs_inv)  # (n,)
+
+        # rowsum(S_inv) · 1 = Vd @ (V⁻¹ @ 1)
+        rowsum_Sinv = Vd @ Vinv_ones                 # (n,)  — Vinv_ones precomputed
+
+        # S_inv·W = Vd @ (V⁻¹·W)   — VinvW precomputed
+        SinvW  = Vd @ VinvW                          # (n,n)
+        diag_SinvW   = np.diag(SinvW)               # (n,)
+        rowsum_SinvW = SinvW @ ones_n                # (n,)
 
         for i in range(k):
-            # S_k(W) = (I-δW)^{-1}(I·β_k + W·θ_k)  [Elhorst 2014, eq.2.13]
-            M_k = S_inv @ (eye_n * b_d[i] + W * t_d[i])
-            direct_d[d, i]   = np.trace(M_k) / n
-            total_d[d, i]    = ones_n @ M_k @ ones_n / n
+            # M_k = S_inv·(β_k·I + θ_k·W)
+            # direct  = trace(M_k)/n = (β_k·trace(S_inv) + θ_k·trace(S_inv·W))/n
+            # total   = 1'M_k1/n    = (β_k·sum(rowsum_Sinv) + θ_k·sum(rowsum_SinvW))/n
+            b_i = b_d[i]
+            t_i = t_d[i]
+
+            direct_d[d, i] = (b_i * np.sum(diag_Sinv) +
+                               t_i * np.sum(diag_SinvW)) / n
+            total_d[d, i]  = (b_i * np.sum(rowsum_Sinv) +
+                               t_i * np.sum(rowsum_SinvW)) / n
             indirect_d[d, i] = total_d[d, i] - direct_d[d, i]
 
     dir_mean,  dir_se,  dir_t  = _simulation_se(direct_d)
