@@ -22,6 +22,7 @@ from .models import (
 from .endogeneity import (
     iv_regression,
     hausman_test,
+    hausman_tw_exogeneity,
     sargan_test,
     redundancy_test,
     stwm_exogeneity_report,
