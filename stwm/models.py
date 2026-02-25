@@ -192,116 +192,110 @@ def _simulation_se(S_draws: np.ndarray,
     return mean, se, tval
 
 
-def _build_full_cov_from_concentrated_ll(neg_ll_func,
-                                          X_aug: np.ndarray,
-                                          W: np.ndarray,
-                                          rho_hat: float,
-                                          sigma2: float,
-                                          ev_W: np.ndarray,
-                                          k_x: int,
-                                          has_theta: bool) -> np.ndarray:
+def _build_full_cov_spreg_style(X_aug: np.ndarray,
+                                W: np.ndarray,
+                                rho_hat: float,
+                                beta_hat: np.ndarray,
+                                sigma2: float,
+                                k_x: int,
+                                has_theta: bool):
     """
-    Build FULL joint covariance matrix for [rho, beta_X, (theta)] via
-    the observed information matrix (numerical Hessian of full log-likelihood).
+    Build FULL joint covariance matrix using spreg's ANALYTIC information matrix.
 
-    This captures the crucial cross-terms between rho and beta/theta that
-    are ZERO in the block-diagonal approximation but NONZERO in finite samples.
-    Including them gives correct SE for indirect effects.
+    Exactly replicates spreg.ml_lag.BaseML_Lag (Anselin 1988, eq. 6.5).
+    This is the gold-standard formula used in all published spatial econometrics.
 
-    Layout of params0: [intercept, beta_1..k, (theta_1..k), rho, sigma2]
-    Output cov layout: [rho, beta_1..k, (theta_1..k)]  (excludes intercept, sigma2)
+    Formula:
+        A    = I - rho*W
+        G    = W @ A^{-1}              (spreg calls this wai)
+        tr1  = tr(G)
+        tr2  = tr(G @ G)
+        tr3  = tr(G.T @ G)
+        pred_e = A^{-1} @ X @ beta     (spreg calls this predy_e)
+        Wpre   = W @ pred_e            (spreg calls this wpredy)
 
-    Parameters
-    ----------
-    neg_ll_func : concentrated neg log-likelihood (function of rho only)
-    X_aug       : (N, p) design matrix (includes intercept)
-    W           : (N, N) weight matrix
-    rho_hat     : estimated rho
-    sigma2      : estimated sigma2
-    ev_W        : eigenvalues of W (real)
-    k_x         : number of X covariates (NOT including intercept or WX)
-    has_theta   : True if SDM (WX included), False if SAR
+        Information matrix v [beta(p), rho, sigma2]:
+            v[:p,:p]     = X'X / sigma2
+            v[:p, p]     = X'Wpre / sigma2      <- NONZERO beta-rho cross-term
+            v[p, p]      = tr2 + tr3 + Wpre'Wpre/sigma2
+            v[p, p+1]    = tr1 / sigma2
+            v[p+1, p+1]  = N / (2*sigma2^2)
+
+        vm1 = inv(v)        # (p+2)x(p+2), same as spreg.vm1
+        vm  = vm1[:-1,:-1]  # (p+1)x(p+1), same as spreg.vm
+
+    Returns
+    -------
+    cov_sim : array (dim_sim, dim_sim)
+        Covariance for [rho, beta_1..k, (theta_1..k)] - for effect simulation
+    vm : array (p+1, p+1)
+        Full covariance for all coefficients - identical to spreg.vm
     """
     N = X_aug.shape[0]
     p = X_aug.shape[1]   # intercept + beta (+ theta for SDM)
+
     A = np.eye(N) - rho_hat * W
-
-    def full_neg_ll(params):
-        b     = params[:p]
-        r     = float(np.clip(params[p], -0.999, 0.999))
-        s2    = max(float(params[p + 1]), 1e-10)
-        d     = np.abs(1.0 - r * ev_W)
-        if np.any(d < 1e-10):
-            return 1e15
-        log_det = np.sum(np.log(d))
-        Ar      = np.eye(N) - r * W
-        e       = Ar @ (X_aug[:, 0] * 0 + np.zeros(N))  # placeholder
-        # Reconstruct Y from the model structure
-        # We use stored AY to reconstruct
-        return 1e15  # not used directly
-
-    # Use analytical Fisher information matrix instead (more stable)
-    # I(beta, beta) = X_aug' X_aug / sigma2
-    I_bb = X_aug.T @ X_aug / sigma2
-
-    # I(rho, rho): from second derivative of concentrated log-likelihood
-    # = tr(G'G + G^2) / sigma2  where G = W (I-rhoW)^{-1}
-    # Numerically from concentrated neg_ll:
-    h2_rho = _numerical_hessian(neg_ll_func, rho_hat, eps=1e-4)
-    I_rr   = max(h2_rho, 1e-12)
-
-    # I(beta, rho): cross-information
-    # Analytically: I(beta_j, rho) = X_aug[:,j]' G (X_aug @ beta_hat) / sigma2
-    # where G = W (I-rhoW)^{-1}
     try:
         Ainv = np.linalg.inv(A)
     except np.linalg.LinAlgError:
         Ainv = np.linalg.pinv(A)
-    G = W @ Ainv    # (N,N)
-    # Current beta_hat (concentrated)
-    AY_placeholder = A @ (X_aug @ np.linalg.lstsq(X_aug, A @ X_aug[:, 0], rcond=None)[0])
 
-    # Cross term: E[∂²lnL/∂β∂ρ] = X' G X β_hat / σ²
-    # But we use the simpler finite-sample version:
-    GX = G @ X_aug   # (N, p)
-    cross = np.array([float(X_aug[:, j] @ GX[:, j]) / sigma2
-                      for j in range(p)])   # only diagonal for now
+    # G = W @ A^{-1}  (identical to spreg's wai)
+    G    = W @ Ainv
+    tr1  = float(np.trace(G))
+    tr2  = float(np.trace(G @ G))
+    tr3  = float(np.trace(G.T @ G))
 
-    # Assemble information matrix for [intercept, beta_1..k, (theta_1..k), rho]
-    dim_full = p + 1
-    I_mat = np.zeros((dim_full, dim_full))
-    I_mat[:p, :p]     = I_bb
-    I_mat[:p, p]      = cross
-    I_mat[p, :p]      = cross
-    I_mat[p, p]       = I_rr
+    # Reduced-form prediction  (identical to spreg's predy_e)
+    pred_e    = Ainv @ (X_aug @ beta_hat)
+    Wpre      = W @ pred_e
+    XtX       = X_aug.T @ X_aug
+    XtWpre    = X_aug.T @ Wpre
+    WpreTWpre = float(Wpre @ Wpre)
 
-    # Regularize
-    I_mat += 1e-8 * np.eye(dim_full)
+    # Information matrix v — identical to spreg's v1/v2/v3 construction
+    v = np.zeros((p + 2, p + 2))
+    v[:p, :p]       = XtX / sigma2
+    v[:p, p]        = XtWpre / sigma2    # beta-rho cross-term (KEY!)
+    v[p, :p]        = XtWpre / sigma2    # symmetric
+    v[p, p]         = tr2 + tr3 + WpreTWpre / sigma2
+    v[p, p + 1]     = tr1 / sigma2
+    v[p + 1, p]     = tr1 / sigma2
+    v[p + 1, p + 1] = N / (2.0 * sigma2 ** 2)
+    v += 1e-10 * np.eye(p + 2)
 
     try:
-        cov_all = np.linalg.inv(I_mat)
+        vm1 = np.linalg.inv(v)   # (p+2)x(p+2), same as spreg.vm1
     except np.linalg.LinAlgError:
-        cov_all = np.linalg.pinv(I_mat)
+        vm1 = np.linalg.pinv(v)
 
-    # Extract [rho, beta_1..k, (theta_1..k)] — skip intercept, skip sigma2
-    idx_rho   = p                              # last row/col in I_mat
+    vm = vm1[:-1, :-1]           # (p+1)x(p+1), same as spreg.vm
+
+    # Extract subset for effect simulation: [rho, beta_1..k, (theta_1..k)]
+    idx_rho = p
     if has_theta:
-        idx_beta  = list(range(1, k_x + 1))
-        idx_theta = list(range(k_x + 1, 2 * k_x + 1))
-        idx_sim   = [idx_rho] + idx_beta + idx_theta
-        dim_sim   = 1 + 2 * k_x
+        idx_sim = [idx_rho] + list(range(1, k_x + 1)) + list(range(k_x + 1, 2 * k_x + 1))
+        dim_sim = 1 + 2 * k_x
     else:
-        idx_beta  = list(range(1, k_x + 1))
-        idx_sim   = [idx_rho] + idx_beta
-        dim_sim   = 1 + k_x
+        idx_sim = [idx_rho] + list(range(1, k_x + 1))
+        dim_sim = 1 + k_x
 
-    cov_sim = np.zeros((dim_sim, dim_sim))
-    for ii, i in enumerate(idx_sim):
-        for jj, j in enumerate(idx_sim):
-            cov_sim[ii, jj] = cov_all[i, j]
+    cov_sim = np.array([[vm[i, j] for j in idx_sim] for i in idx_sim])
+    return cov_sim, vm
 
-    return cov_sim
 
+def _jacobian_logdet(rho: float, ev_c: np.ndarray) -> float:
+    """
+    Compute log|det(I - rho*W)| via complex eigenvalues.
+
+    Replicates spreg lag_c_loglik_ord formula:
+        jacob = sum(log(1 - rho*eigvals)).real
+
+    CRITICAL: Use complex eigenvalues and take .real at the END.
+    This is correct because log|det(A)| = Re(sum(log(eigenvalues of A))).
+    DO NOT use: sum(log(|1 - rho*Re(eigvals)|)) -- WRONG for non-symmetric W.
+    """
+    return float(np.sum(np.log(1.0 - rho * ev_c)).real)
 
 def _effect_inference(W: np.ndarray,
                        beta_X: np.ndarray,
@@ -566,7 +560,7 @@ def _bayesian_sar_mcmc(Y: np.ndarray,
         # --- MH δ | Y, β, σ² ---
         def log_post(r):
             if abs(r) >= 0.999: return -1e15
-            d_eig = 1.0 - r * ev_W
+            d_eig = 1.0 - r * ev_c
             if np.any(d_eig <= 0): return -1e15
             ld  = float(np.sum(np.log(d_eig)))
             Ar  = I_N - r * W
@@ -740,7 +734,7 @@ class SpatialLagModel:
     def _fit_ml(self, Y, X, N, k, rho_bounds, n_draws, seed):
         W     = self.W
         X_aug = np.column_stack([np.ones(N), X])
-        ev_W  = np.linalg.eigvals(W).real
+        ev_c  = np.linalg.eigvals(W)  # complex eigenvalues (spreg ord method)
 
         def neg_ll(rho):
             A      = np.eye(N) - rho * W
@@ -749,7 +743,7 @@ class SpatialLagModel:
             resid  = AY - X_aug @ beta
             sigma2 = float(resid @ resid) / N
             if sigma2 <= 0: return 1e15
-            log_det = float(np.sum(np.log(np.abs(1.0 - rho * ev_W))))
+            log_det = _jacobian_logdet(rho, ev_c)
             return 0.5 * N * np.log(sigma2) - log_det
 
         rho_hat = _grid_search_then_refine(neg_ll, rho_bounds)
@@ -759,22 +753,16 @@ class SpatialLagModel:
         resid   = AY - X_aug @ beta
         sigma2  = float(resid @ resid) / N
 
-        # Full covariance (captures rho-beta cross terms)
-        cov_sim = _build_full_cov_from_concentrated_ll(
-            neg_ll, X_aug, W, rho_hat, sigma2, ev_W, k, has_theta=False)
+        # Full covariance — spreg analytic information matrix (Anselin 1988)
+        cov_sim, vm = _build_full_cov_spreg_style(
+            X_aug, W, rho_hat, beta, sigma2, k, has_theta=False)
 
-        # SE(rho) from information matrix
-        se_rho = float(np.sqrt(max(cov_sim[0, 0], 0)))
+        # SE(rho) from spreg-style vm  (vm layout: [intercept..beta, rho])
+        se_rho = float(np.sqrt(max(vm[X_aug.shape[1], X_aug.shape[1]], 0)))
 
-        # SE(beta) from ML covariance (exclude intercept row)
-        se_beta_sim = np.array([np.sqrt(max(cov_sim[1 + j, 1 + j], 0)) for j in range(k)])
-
-        # Fallback: also compute from OLS covariance on AY~X_aug
+        # SE(beta) from spreg-style vm (rows 1..k, skip intercept at row 0)
+        se_beta = np.array([np.sqrt(max(vm[1 + j, 1 + j], 0)) for j in range(k)])
         sigma2_df = float(resid @ resid) / (N - X_aug.shape[1])
-        ols_cov   = sigma2_df * np.linalg.pinv(X_aug.T @ X_aug)
-        se_beta_ols = np.sqrt(np.maximum(np.diag(ols_cov)[1:], 0))
-        # Use whichever is more conservative
-        se_beta = np.maximum(se_beta_sim, se_beta_ols)
 
         eff = _effect_inference(W, beta[1:], np.zeros(k), rho_hat,
                                 cov_sim, N, k, D=n_draws, seed=seed)
@@ -959,7 +947,7 @@ class SpatialErrorModel:
         X     = np.asarray(X, dtype=float)
         N, k  = X.shape
         W     = self.W
-        ev_W  = np.linalg.eigvals(W).real
+        ev_c  = np.linalg.eigvals(W)  # complex eigenvalues (spreg ord method)
         X_aug = np.column_stack([np.ones(N), X])
         method = method.lower()
 
@@ -1127,7 +1115,7 @@ class SDMModel:
         W     = self.W
         WX    = W @ X
         X_aug = np.column_stack([np.ones(N), X, WX])   # [1, X, WX]
-        ev_W  = np.linalg.eigvals(W).real
+        ev_c  = np.linalg.eigvals(W)  # complex eigenvalues (spreg ord method)
 
         def neg_ll(rho):
             A      = np.eye(N) - rho * W
@@ -1136,7 +1124,7 @@ class SDMModel:
             resid  = AY - X_aug @ beta
             sigma2 = float(resid @ resid) / N
             if sigma2 <= 0: return 1e15
-            log_det = float(np.sum(np.log(np.abs(1.0 - rho * ev_W))))
+            log_det = _jacobian_logdet(rho, ev_c)
             return 0.5 * N * np.log(sigma2) - log_det
 
         rho_hat = _grid_search_then_refine(neg_ll, rho_bounds)
@@ -1149,21 +1137,16 @@ class SDMModel:
         beta_X = beta[1:k + 1]
         theta  = beta[k + 1:2 * k + 1]
 
-        # Full covariance for [rho, beta_1..k, theta_1..k]
-        cov_sim = _build_full_cov_from_concentrated_ll(
-            neg_ll, X_aug, W, rho_hat, sigma2, ev_W, k, has_theta=True)
+        # Full covariance — spreg analytic information matrix (Anselin 1988)
+        cov_sim, vm = _build_full_cov_spreg_style(
+            X_aug, W, rho_hat, beta, sigma2, k, has_theta=True)
 
-        se_rho  = float(np.sqrt(max(cov_sim[0, 0], 0)))
-        se_bX   = np.array([np.sqrt(max(cov_sim[1+j, 1+j], 0)) for j in range(k)])
-        se_th   = np.array([np.sqrt(max(cov_sim[1+k+j, 1+k+j], 0)) for j in range(k)])
-
-        # Also get OLS SE as fallback
+        # SE from spreg-style vm (vm layout: [intercept, beta_1..k, theta_1..k, rho])
+        p_aug = X_aug.shape[1]  # = 1 + 2k for SDM
+        se_rho = float(np.sqrt(max(vm[p_aug, p_aug], 0)))
+        se_bX  = np.array([np.sqrt(max(vm[1 + j, 1 + j], 0)) for j in range(k)])
+        se_th  = np.array([np.sqrt(max(vm[1 + k + j, 1 + k + j], 0)) for j in range(k)])
         sigma2_df = float(resid @ resid) / (N - X_aug.shape[1])
-        ols_cov   = sigma2_df * np.linalg.pinv(X_aug.T @ X_aug)
-        se_bX_ols = np.sqrt(np.maximum(np.diag(ols_cov)[1:k+1], 0))
-        se_th_ols = np.sqrt(np.maximum(np.diag(ols_cov)[k+1:2*k+1], 0))
-        se_bX = np.maximum(se_bX, se_bX_ols)
-        se_th  = np.maximum(se_th, se_th_ols)
 
         eff = _effect_inference(W, beta_X, theta, rho_hat,
                                 cov_sim, N, k, D=n_draws, seed=seed)
