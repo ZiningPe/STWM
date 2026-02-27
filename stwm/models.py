@@ -29,7 +29,7 @@ Simplifications (Elhorst 2014, Table 2.1):
     SEM : Direct=β_k, Indirect=0
     SDM : S_k=(I-δW)⁻¹(Iβ_k + Wθ_k)
 
-Effect Inference — Delta Method (LeSage & Pace 2009, Ch.2)
+Effect Inference — Delta Method (LeSage & Pace 2009)
 -----------------------------------------------------------
 Direct/indirect effects are smooth functions of (ρ, β, θ).
 Standard errors are computed analytically via the Delta Method:
@@ -56,12 +56,17 @@ Covariance Matrix (spreg analytic formula, Anselin 1988 eq. 6.5)
 
 References
 ----------
-Ord (1975). JASA 70, 120–126.
-Lee (2004). Econometrica 72, 1899–1925.
-Anselin (1988). Spatial Econometrics. Kluwer.
-Elhorst (2014). Spatial Econometrics. Springer.
-LeSage & Pace (2009). Introduction to Spatial Econometrics. CRC.
-Halleck Vega & Elhorst (2015). Journal of Regional Science 55, 339–363.
+Anselin, L. (1988). Spatial econometrics: Methods and models. Kluwer Academic Publishers.
+
+Elhorst, J. P. (2014). Spatial econometrics: From cross-sectional data to spatial panels. Springer.
+
+Halleck Vega, S., & Elhorst, J. P. (2015). The SLX model. Journal of Regional Science, *55*(3), 339–363.
+
+Lee, L. F. (2004). Asymptotic distributions of quasi-maximum likelihood estimators for spatial autoregressive models. Econometrica, *72*(6), 1899–1925.
+
+LeSage, J., & Pace, R. K. (2009). Introduction to spatial econometrics. CRC Press.
+
+Ord, K. (1975). Estimation methods for models of spatial interaction. Journal of the American Statistical Association, *70*(349), 120–126.
 """
 
 import numpy as np
