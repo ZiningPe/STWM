@@ -10,7 +10,7 @@ Functions
 ---------
 1. rolling_effects        : estimate effects for any sliding time window
 2. regional_effects       : estimate effects for any user-defined set of regions
-3. unit_effects           : effect of a shock in ONE unit propagating to ALL others
+3. unit_effects           : effect of a shock happened in ONE spatial unit at a given time propagating to ALL other spatial units at t, t+1, t+2, etc.
 4. spillover_heatmap      : N×T matrix of indirect effects (visualise evolution)
 5. coefficient_stability  : track how β, direct, indirect change over time
 """
