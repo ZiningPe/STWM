@@ -26,8 +26,8 @@ Given a T-length sequence of statistics {a_1, ..., a_T}:
 
     Processing pipeline:
         Step 1: Replace |denominator| < min_abs with sign * min_abs
-        Step 2: Winsorise at quantile q: clip(., 0, Q_q(|entries|))
-        Step 3: Clip negatives to 0
+        Step 2: Winsorise at quantile q: clip(., -Q_q, +Q_q)
+        Step 3: Take absolute value (preserves dispersion magnitude)
         Step 4: Row-standardise: TWM[t,:] /= sum(TWM[t,:])
 
 Admissibility Conditions (Elhorst 2014, Section 2.2)
@@ -72,7 +72,7 @@ def _ratio_matrix(stats: np.ndarray,
     if len(off) > 0:
         cap = np.quantile(np.abs(off), winsorize_quantile)
         mat = np.clip(mat, -cap, cap)
-    mat = np.where(mat < 0, 0.0, mat)
+    mat = np.abs(mat)   # preserve magnitude of dispersion (I < 0) rather than zeroing
     rs  = mat.sum(axis=1, keepdims=True)
     rs  = np.where(rs == 0, 1.0, rs)
     return mat / rs
@@ -341,27 +341,34 @@ def build_twm_decay(T: int,
 
 def twm_stability_check(TWM: np.ndarray, rho_max: float = 0.99) -> dict:
     """
-    Verify all admissibility conditions for a TWM.
+    Verify admissibility conditions for a TWM.
 
     Checks:
       (1) Non-negativity       : all entries ≥ 0
       (2) Row-standardisation  : each row sums to 1 (tol 1e-6)
-      (3) Spectral radius      : max|λ| < rho_max
-      (4) No NaN/Inf
+      (3) No NaN/Inf
+
+    Note on spectral radius:
+      A row-normalised lower-triangular TWM always has spectral radius = 1.0
+      (Perron-Frobenius: eigenvalues = diagonal = 1 for the first row).
+      The relevant admissibility constraint for SAR/SDM is on the δ parameter
+      (|δ| < 1/ρ(STWM)), NOT on ρ(TWM) itself.  We therefore report the
+      spectral radius for information only and do NOT fail the check on it.
 
     Returns
     -------
     dict with keys: non_negative, row_standardised, spectral_radius,
-                    stable, has_nan_inf, passed
+                    has_nan_inf, passed
     """
     non_neg  = bool(np.all(TWM >= 0))
     row_std  = bool(np.allclose(TWM.sum(axis=1), 1.0, atol=1e-6))
-    spec_rad = float(np.max(np.abs(np.linalg.eigvals(TWM))))
-    stable   = spec_rad < rho_max
+    # Eigenvalues of lower-triangular matrix = diagonal entries
+    spec_rad = float(np.max(np.abs(np.diag(TWM))))   # fast: O(T) not O(T³)
     has_nan  = bool(np.any(~np.isfinite(TWM)))
-    passed   = non_neg and row_std and stable and (not has_nan)
+    # Spectral radius deliberately excluded from passed (always ≈ 1 by construction)
+    passed   = non_neg and row_std and (not has_nan)
     result   = dict(non_negative=non_neg, row_standardised=row_std,
-                    spectral_radius=round(spec_rad, 6), stable=stable,
+                    spectral_radius=round(spec_rad, 6),
                     has_nan_inf=has_nan, passed=passed)
     if not passed:
         warnings.warn(f"TWM admissibility FAILED: {result}", stacklevel=2)
@@ -371,6 +378,80 @@ def twm_stability_check(TWM: np.ndarray, rho_max: float = 0.99) -> dict:
 # ---------------------------------------------------------------------------
 # Convenience: compute all four statistics for a given year's data
 # ---------------------------------------------------------------------------
+
+def validate_stwm_ordering(W_full: np.ndarray,
+                           SWM: np.ndarray,
+                           TWM: np.ndarray,
+                           tol: float = 1e-8) -> dict:
+    """
+    Validate that W_full is consistent with time-major Kronecker ordering.
+
+    The STWM package convention is::
+
+        W_full = np.kron(TWM, SWM)          # (nT × nT)
+
+    which corresponds to *time-major* panel stacking:
+    obs 0..n−1 → all units at t=0,  obs n..2n−1 → all units at t=1, …
+
+    This function checks whether the supplied W_full equals np.kron(TWM, SWM)
+    element-wise (up to tolerance) and reports block-level details if not.
+
+    Parameters
+    ----------
+    W_full : (nT, nT) full spatial-temporal weight matrix
+    SWM    : (n, n)  spatial weight matrix
+    TWM    : (T, T)  temporal weight matrix
+    tol    : absolute tolerance for element-wise comparison (default 1e-8)
+
+    Returns
+    -------
+    dict with keys:
+      consistent      : bool — True if W_full ≈ kron(TWM, SWM)
+      max_abs_diff    : float — maximum element-wise absolute difference
+      T               : int — number of time periods (inferred from TWM)
+      n_units         : int — number of spatial units (inferred from SWM)
+      stacking        : str — description of expected ordering convention
+      message         : str — ✓ or ✗ with diff magnitude
+      block_errors    : list of (t1, t2, diff) for blocks with diff > tol
+                        (only populated when not consistent)
+
+    Example
+    -------
+    >>> result = validate_stwm_ordering(STWM, SWM, TWM)
+    >>> assert result['consistent'], result['message']
+    """
+    T = TWM.shape[0]
+    n = SWM.shape[0]
+    expected    = np.kron(TWM, SWM)
+    diff_mat    = np.abs(W_full - expected)
+    max_diff    = float(diff_mat.max())
+    consistent  = bool(max_diff < tol)
+
+    block_errors = []
+    if not consistent:
+        for t1 in range(T):
+            for t2 in range(T):
+                r0, r1 = t1 * n, (t1 + 1) * n
+                c0, c1 = t2 * n, (t2 + 1) * n
+                bd = float(diff_mat[r0:r1, c0:c1].max())
+                if bd >= tol:
+                    block_errors.append((t1, t2, round(bd, 6)))
+
+    msg = ('✓ Consistent with kron(TWM, SWM)  [time-major ordering]'
+           if consistent
+           else f'✗ Inconsistent: max diff = {max_diff:.2e}; '
+                f'{len(block_errors)} block(s) violate tolerance')
+
+    return dict(
+        consistent=consistent,
+        max_abs_diff=round(max_diff, 10),
+        T=T,
+        n_units=n,
+        stacking='time-major: W_full[t1*n:(t1+1)*n, t2*n:(t2+1)*n] = TWM[t1,t2]*SWM',
+        message=msg,
+        block_errors=block_errors,
+    )
+
 
 def compute_all_temporal_stats(y: np.ndarray, W: np.ndarray) -> dict:
     """

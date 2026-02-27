@@ -108,23 +108,23 @@ def print_rolling_effects(results: dict, var_idx: int = 0):
     var_names = results.get("_var_names", [])
     var_name  = var_names[var_idx] if var_idx < len(var_names) else f"x{var_idx+1}"
 
-    print(f"\n{'─'*70}")
+    print(f"\n{'─'*80}")
     print(f"  Rolling Effects: {var_name}")
-    print(f"{'─'*70}")
-    print(f"  {'Window':<12} {'Direct':>9} {'t':>7} {'Indirect':>10} {'t':>7} {'Total':>9} {'t':>7}")
-    print(f"  {'─'*68}")
+    print(f"{'─'*80}")
+    print(f"  {'Window':<12} {'Direct':>9} {'p':>7} {'Indirect':>10} {'p':>7} {'Total':>9} {'p':>7}")
+    print(f"  {'─'*78}")
     for w in windows:
         res = results.get(w, {})
         if "error" in res:
             print(f"  {w:<12}  ERROR: {res['error']}")
             continue
-        d  = res['direct'][var_idx]  if res.get('direct')  is not None else np.nan
-        i  = res['indirect'][var_idx] if res.get('indirect') is not None else np.nan
-        tt = res['total'][var_idx]   if res.get('total')   is not None else np.nan
-        dt = res['direct_t'][var_idx]  if res.get('direct_t')  is not None else np.nan
-        it = res['indirect_t'][var_idx] if res.get('indirect_t') is not None else np.nan
-        ttt = res['total_t'][var_idx]  if res.get('total_t')   is not None else np.nan
-        print(f"  {w:<12} {d:>9.4f} {dt:>7.3f} {i:>10.4f} {it:>7.3f} {tt:>9.4f} {ttt:>7.3f}")
+        d   = res['direct'][var_idx]   if res.get('direct')   is not None else np.nan
+        i   = res['indirect'][var_idx] if res.get('indirect') is not None else np.nan
+        tt  = res['total'][var_idx]    if res.get('total')    is not None else np.nan
+        dp  = res['direct_p'][var_idx]   if res.get('direct_p')   is not None else np.nan
+        ip  = res['indirect_p'][var_idx] if res.get('indirect_p') is not None else np.nan
+        tp  = res['total_p'][var_idx]    if res.get('total_p')    is not None else np.nan
+        print(f"  {w:<12} {d:>9.4f} {dp:>7.4f} {i:>10.4f} {ip:>7.4f} {tt:>9.4f} {tp:>7.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -199,21 +199,23 @@ def print_regional_comparison(results: dict, var_idx: int = 0):
     var_name = var_names[var_idx] if (var_names and var_idx < len(var_names)) \
                else f"x{var_idx+1}"
 
-    print(f"\n{'─'*70}")
+    print(f"\n{'─'*80}")
     print(f"  Regional Effect Comparison: {var_name}")
-    print(f"{'─'*70}")
-    print(f"  {'Region':<16} {'N units':>8} {'Direct':>9} {'t':>7} {'Indirect':>10} {'t':>7}")
-    print(f"  {'─'*65}")
+    print(f"{'─'*80}")
+    print(f"  {'Region':<16} {'N units':>8} {'Direct':>9} {'p':>7} {'Indirect':>10} {'p':>7} {'Total':>9} {'p':>7}")
+    print(f"  {'─'*78}")
     for reg, res in results.items():
         if "error" in res:
             print(f"  {reg:<16}  ERROR: {res['error']}")
             continue
-        nu = res.get("_n_units", "?")
-        d  = res["direct"][var_idx]
-        i  = res["indirect"][var_idx]
-        dt = res.get("direct_t",  [np.nan]*10)[var_idx]
-        it = res.get("indirect_t", [np.nan]*10)[var_idx]
-        print(f"  {reg:<16} {nu:>8} {d:>9.4f} {dt:>7.3f} {i:>10.4f} {it:>7.3f}")
+        nu  = res.get("_n_units", "?")
+        d   = res["direct"][var_idx]
+        i   = res["indirect"][var_idx]
+        tot = res.get("total", res["direct"])[var_idx]
+        dp  = res.get("direct_p",   [np.nan]*20)[var_idx]
+        ip  = res.get("indirect_p", [np.nan]*20)[var_idx]
+        tp  = res.get("total_p",    [np.nan]*20)[var_idx]
+        print(f"  {reg:<16} {nu:>8} {d:>9.4f} {dp:>7.4f} {i:>10.4f} {ip:>7.4f} {tot:>9.4f} {tp:>7.4f}")
 
 
 # ---------------------------------------------------------------------------

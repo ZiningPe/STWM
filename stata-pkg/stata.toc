@@ -1,0 +1,3 @@
+v 3
+d stwm — Spatial-Temporal Weight Matrix (STWM) package for Stata
+p stwm stwm: Spatial-Temporal Weight Matrix models for Stata (requires Python)

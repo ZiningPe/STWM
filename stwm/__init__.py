@@ -10,6 +10,7 @@ from .temporal_weights import (
     compute_spatial_gini,
     compute_all_temporal_stats,
     twm_stability_check,
+    validate_stwm_ordering,
 )
 from .stwm_core import build_stwm, stwm_summary
 from .models import (
@@ -22,6 +23,7 @@ from .models import (
 from .endogeneity import (
     iv_regression,
     hausman_test,
+    hausman_tw_exogeneity,
     sargan_test,
     redundancy_test,
     stwm_exogeneity_report,

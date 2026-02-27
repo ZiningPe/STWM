@@ -1,0 +1,38 @@
+v 3
+d stwm: Spatial-Temporal Weight Matrix package for Stata
+d
+d Author: Wang Zining
+d Support: https://github.com/wangzining/stwm
+d
+d Requires: Stata 16.0 or later with Python integration enabled.
+d           Python packages: numpy, scipy, pandas, stwm (pip install stwm)
+d
+d stwm_build      - Build a Spatial-Temporal Weight Matrix (STWM)
+d stwm_sdm        - Spatial Durbin Model via STWM
+d stwm_sar        - Spatial Autoregressive Model via STWM
+d stwm_sem        - Spatial Error Model via STWM
+d stwm_slx        - Spatial Lag of X Model via STWM
+d stwm_hausman    - Exogeneity test battery (Hausman + Sargan + Redundancy)
+d stwm_sensitivity - Sensitivity analysis: TWM hyperparameter grid
+d stwm_mc         - Monte Carlo validation of the STWM estimator
+d stwm_granger    - Granger causality: Moran's I to spillover parameters
+d
+f ado/stwm_build.ado
+f ado/stwm_sdm.ado
+f ado/stwm_sar.ado
+f ado/stwm_sem.ado
+f ado/stwm_slx.ado
+f ado/stwm_hausman.ado
+f ado/stwm_sensitivity.ado
+f ado/stwm_mc.ado
+f ado/stwm_granger.ado
+f help/stwm_build.sthlp
+f help/stwm_sdm.sthlp
+f help/stwm_sar.sthlp
+f help/stwm_sem.sthlp
+f help/stwm_slx.sthlp
+f help/stwm_hausman.sthlp
+f help/stwm_sensitivity.sthlp
+f help/stwm_mc.sthlp
+f help/stwm_granger.sthlp
+e
